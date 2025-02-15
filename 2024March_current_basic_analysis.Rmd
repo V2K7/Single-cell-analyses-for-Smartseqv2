@@ -1,0 +1,564 @@
+---
+title: "Analyses of single cell data using CPM/TMMwsp/DESEQ2/VST on single sequencing run"
+author: "VJKR"
+date: "2024-02-29"
+output: html_document
+---
+
+```{r, echo=FALSE, warning=F, message=F}
+
+rm(list=ls())
+knitr::opts_chunk$set(fig.width=15, fig.height=15, echo=FALSE, warning=FALSE, message=FALSE)
+knitr::opts_chunk$set(dev.args=list(bg="transparent")) 
+graphics.off()
+#location of root directory
+ROOT_DIR<-"//xyz/abc"
+stem<-"SampleID"
+
+meta_file<-"metadata_Date.xlsx"
+
+#specify column index of controls based on counts data or metadata
+jeg_colindex<-c(1:3)
+wbc_colindex<-c(4:5)
+
+DATA_DIR <- file.path(ROOT_DIR, stem, "Analysis", "data")     
+RES_DIR  <- file.path(ROOT_DIR, stem, "Analysis", "res")   
+RMD_DIR  <- file.path(ROOT_DIR, stem, "Analysis", "rmd")    
+SF_DIR  <- file.path(ROOT_DIR, stem, "quantsf")
+GSET_DIR <- file.path(ROOT_DIR, "Gene sets")
+PRES_DIR <- file.path(ROOT_DIR, stem, "Analysis", "pres")
+META_DIR <- file.path(ROOT_DIR, stem, "Analysis", "meta")
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(ggplot2)
+  library(ggrepel)
+  library(readxl)
+  library(biomaRt)
+  library(org.Hs.eg.db)
+  library(dplyr)
+  library(openxlsx)
+  library(pheatmap)
+  library(plyr)
+  library(tibble)
+  library(Rsubread)
+  library(stringr)
+  library(EnhancedVolcano)
+  library(ggrepel)
+  library(stringi)
+  library(vsn)
+  library(pheatmap)
+  library(viridis)
+  library(tximport)
+  library(knitr)
+  library(tidyverse)
+  library(Seurat)
+  library(RColorBrewer)
+  library(openxlsx)
+  library(edgeR)
+  library(ggpmisc)
+  library(plotly)
+  library(stats)
+  library(htmlwidgets)
+  library(stringr)
+  xfun::pkg_load2(c('base64enc', 'htmltools', 'mime'))
+})
+
+```
+#Current objective:Based on quant.genes.sf file saved in the case directory, create a raw count matrix.
+
+#Making a single dataframe of quant.sf files for use in analysis
+```{r rawcount}
+
+#set directory for multiple quant files
+quantsf<-list.files(SF_DIR, pattern = "\\.genes.sf$")
+basename(quantsf)
+
+quantsnames <- str_sub(quantsf, 1, -33)
+quantsnames
+
+setwd(SF_DIR)
+names(quantsf) <- paste0(quantsnames)
+
+#Generate txi object from salmon quant files
+
+sfmat <- tximport(files = quantsf,
+           type = "salmon",
+           txIn = F,
+           txOut = F,
+           countsFromAbundance = "no",
+           tx2gene = NULL,
+           varReduce = FALSE,
+           dropInfReps = FALSE,
+           infRepStat = NULL,
+           ignoreTxVersion = T,
+           ignoreAfterBar = FALSE,
+           geneIdCol = "Name",
+           txIdCol = NULL,
+           abundanceCol = "TPM",
+           countsCol = "NumReads",
+           lengthCol = "Length",
+           importer = NULL,
+           existenceOptional = F,
+           sparse = FALSE,
+           sparseThreshold = 1,
+           )
+
+names(sfmat)
+head(sfmat$counts)
+colnames(sfmat$length)
+countsf<-sfmat$counts
+Date<-str_sub(quantsf[1], 10, -26)
+write.csv(countsf,paste0(DATA_DIR,"/",Date,"_",stem,"_rawcounts",".csv"))
+
+```
+#pull in metadata for plot annotation
+```{r ,metadata}
+setwd(META_DIR)
+meta <- read.xlsx(file.path(META_DIR,meta_file))
+
+#if BlkJEG is run as first sample every sequencing run
+meta$Date<-rep(Date,nrow(meta))
+
+#adding contrast to use for DE analyses; IND, HYB are included in CTB
+meta$contrast<-ifelse(meta$CellType %in% c('CTB', 'IND','HYB'), "CTB", meta$CellType)
+meta<-meta %>% remove_rownames %>% column_to_rownames(var="SampleID")
+meta$CellType<-as.factor(meta$CellType)
+meta$CellStatus<-as.factor(meta$CellStatus)
+meta$contrast<-as.factor(meta$contrast)
+meta$Source<-as.factor(meta$Source)
+meta$Date<-as.factor(meta$Date)
+meta$Days_to_pick<-as.factor(meta$Days_to_pick)
+sapply(meta, class)
+
+#order metadata according to countsf columns
+meta<-meta[colnames(countsf),]
+```
+
+
+
+#Use seurat for mito ribo  linc HB total genes  total counts and plots
+#CPM 
+
+#Heatmap for CA  using CPM +PCA
+#classify by CPM, heatmap_classify
+
+#filter samples by low # genes
+#filter genes low exp
+
+#Normalize TMM and heatmap + PCA
+#Normalize DESEQ2, VST and PCA , heatmap for CA genes
+#DE using DESEQ2, keep mito, ribo,linc
+
+
+##CPM matrix and evaluation of cell quality via Cell atlas gene set
+```{r}
+countsf<-na.omit(countsf)
+
+#remove numerical extension from ENSMBL gene id 
+rownames(countsf) <- sub("[.][0-9]*","",rownames(countsf))
+
+#Add hgnc symbols to the matrix
+geneIDs <- rownames(countsf)
+
+#get gene names, ensembl 109 used which corresponds to Gencode v43
+mart <- mart <- useMart(host = "https://feb2023.archive.ensembl.org", biomart = "ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl")
+gene_symbols <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol"), values = geneIDs, mart= mart)
+
+#Adding gene names(hgnc_symbol) to counts
+countsf<-as.data.frame(countsf)
+countsf$hgnc_symbol <- gene_symbols$hgnc_symbol[match(rownames(countsf), gene_symbols$ensembl_gene_id)]
+
+#removing rows with no gene names or na
+countsf<-countsf[!(is.na(countsf$hgnc_symbol) | (countsf$hgnc_symbol)==""), ]
+
+#providing unique gene names for the duplicates by adding .1, etc
+countsf$hgnc_symbol<- make.unique(countsf$hgnc_symbol)
+
+#Gene names as row names and remove the column og hgnc_symbol
+countsf<-countsf %>% remove_rownames %>% column_to_rownames(var="hgnc_symbol")
+mito_genes <- grep("^MT-", rownames(countsf), value = TRUE)
+ribo_genes <- grep("^RP[SL]", rownames(countsf), value = TRUE)
+linc_genes <- grep("LINC", rownames(countsf), value = TRUE)
+
+write.csv(countsf,paste0(DATA_DIR,"/",Date,"_",stem,"_genename_rawcounts",".csv"))
+
+```
+
+#QC for obtaining bar graphs and correlation plots for QC metrics - total counts, total genes, #mito, ribo,LINC genes, HB genes
+```{r seurat QC plots }
+
+#Testing if sampleIDs in metadata and counts match
+matched <- intersect(rownames(meta), colnames(countsf))
+all <-  union(rownames(meta), colnames(countsf))
+non.matched <- all[!all %in% matched]
+
+countsf<-countsf[ , !(names(countsf) %in% non.matched)]
+
+ctb_seurat=CreateSeuratObject(
+  counts=countsf,
+  project = "CTB_Seurat",
+  assay = "RNA",
+  meta.data = meta,
+)
+
+#original identity set to sample names
+ctb_seurat$orig.ident<-colnames(ctb_seurat)
+Idents(ctb_seurat)<-colnames(ctb_seurat)
+
+#mitochondrial percent
+ctb_seurat[["percent.mt"]] <- PercentageFeatureSet(ctb_seurat, pattern = "^MT-")
+# Show QC metrics for the first 5 cells
+head(ctb_seurat@meta.data, 5)
+
+#ribosomal content
+
+ctb_seurat[["percent.ribo"]] <- PercentageFeatureSet(ctb_seurat, pattern = "^RP[SL]")
+#FeatureScatter(ctb_seurat, feature1 = "nCount_RNA", feature2 = "percent.ribo",pt.size=2)
+
+#Hemoglobin genes
+
+HBB<-read.csv((paste0(ROOT_DIR,"/Gene sets","/HBB.csv")),header=T)
+percent.HB <- Matrix::colSums(ctb_seurat@assays$RNA$counts[rownames(ctb_seurat) %in% HBB$x , ])*100/Matrix::colSums(ctb_seurat@assays$RNA$counts)
+ctb_seurat <- AddMetaData(object = ctb_seurat, metadata = percent.HB, col.name = "percent.HB")
+#FeatureScatter(ctb_seurat, feature1 = "nCount_RNA", feature2 = "percent.HB",pt.size=2)
+
+#LINC RNA
+ctb_seurat[["percent.LINC"]] <- PercentageFeatureSet(ctb_seurat, pattern = "^LINC")
+#FeatureScatter(ctb_seurat, feature1 = "nCount_RNA", feature2 = "percent.LINC",pt.size=2)
+
+# estimate number of reads per gene
+ctb_seurat$log10readstoGenes<- log10(ctb_seurat$nCount_RNA) / log10(ctb_seurat$nFeature_RNA)
+
+# Add cell IDs to metadata
+ctb_seurat <- AddMetaData(object = ctb_seurat, metadata = colnames(ctb_seurat), col.name = "cells")
+
+# Create metadata dataframe for QC only (density plots)
+metadata_qc <- ctb_seurat@meta.data
+
+#export metadata with updated metrics
+write.csv(metadata_qc,paste0(META_DIR,"/",Date,"_",stem,"_metadata_updated",".csv"))
+
+#Rename columns
+metadata_qc <- metadata_qc %>%
+        dplyr::rename(nCount = nCount_RNA,
+                      nGene = nFeature_RNA)
+
+#scatter plots for raw counts: QC metrics
+#Total count and total number of genes detected
+Idents(ctb_seurat)<-ctb_seurat$Source
+FeatureScatter(ctb_seurat,feature1 = "nFeature_RNA",feature2="nCount_RNA",pt.size = 3)
+metadata_qc %>% 
+    ggplot(aes(color=Source, x=nCount, y=nGene)) + stat_poly_eq()+
+    geom_point(size=3)+ggtitle("Correlation between total genes detected and total count")
+
+#Mitochondrial content and total number of genes detected
+FeatureScatter(ctb_seurat,feature1 = "nFeature_RNA",feature2="percent.mt",pt.size = 3)
+metadata_qc %>% 
+    ggplot(aes(color=Source, x=nGene, y=percent.mt)) + stat_poly_eq(label.x = "right",label.y="top")+
+    geom_point(size=3)+ggtitle("Correlation between number of genes and mitochondrial content")
+
+#Bar plots for QC
+metadata_qc %>%
+  ggplot( aes(x=cells, y=nGene, fill=Source)) + geom_bar(stat="identity",colour="white")+ theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+ggtitle("Total number of genes per cell")
+
+metadata_qc %>%
+  ggplot( aes(x=cells, y=log10(nCount), fill=Source)) + geom_bar(stat="identity",colour="white")+ theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+ggtitle("Total count per cell")
+
+metadata_qc %>%
+  ggplot(aes(x=cells, y=percent.mt, fill=Source)) + geom_bar(stat="identity",colour="white")+ theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+ggtitle("Percent Mitochondrial content per cell")
+
+metadata_qc %>%
+  ggplot(aes(x=cells, y=percent.HB, fill=Source)) + geom_bar(stat="identity",colour="white")+ theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+ggtitle("Percent Hemoglobin genes per cell")
+
+metadata_qc %>%
+ggplot(aes(x=cells, y=percent.ribo, fill=Source)) + geom_bar(stat="identity",colour="white")+ theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+ggtitle("Percent Ribosomal genes per cell")
+
+metadata_qc %>%
+ggplot(aes(x=cells, y=percent.LINC, fill=Source)) + geom_bar(stat="identity",colour="white")+ theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))+ggtitle("Percent LINC genes per cell")
+
+#Combined metric plot with lines at 2000 genes and 0.5E06 counts
+
+metadata_qc %>% 
+    ggplot(aes(x=nCount, y=nGene, color=percent.mt)) + 
+    geom_point(size=3) + 
+    scale_colour_gradient(low = "darkgreen", high = "magenta") +
+    stat_smooth(method=lm) +
+    scale_x_log10() + 
+    scale_y_log10() + 
+    theme_classic() +
+    geom_vline(xintercept = 500000,col) +
+    geom_hline(yintercept = 2000) +
+    facet_wrap(~Source)+ggtitle("Percent mitochondrial content, total count and total number of genes detected per cell")
+
+#Violin plots using raw count data
+Idents(ctb_seurat)<-ctb_seurat$Source
+VlnPlot(ctb_seurat, features = c("nFeature_RNA", "nCount_RNA","log10readstoGenes"), ncol = 3, pt.size=2) 
+VlnPlot(ctb_seurat, features = c("percent.mt","percent.HB","percent.ribo","percent.LINC"), ncol = 4, pt.size=2)
+
+#Normalize with log10 (1+CPM)
+ctb_seurat<-NormalizeData(ctb_seurat, normalization.method = "LogNormalize", scale.factor = 1000000)
+#Scale data
+all.genes <- rownames(ctb_seurat)
+ctb_seurat <- ScaleData(object = ctb_seurat, features=all.genes,vars.to.regress = "percent.HB")
+
+ctb_seurat <- RunPCA(ctb_seurat,npcs=(dim(ctb_seurat)[2])-1, features = rownames(ctb_seurat),approx=FALSE)
+
+PCA<-DimPlot(ctb_seurat, reduction = "pca",group.by="Source",pt.size=5,dims=c(1,2)) +theme(legend.position = c(0.8, 0.8))+ggtitle("PCA plot showing CTB clusters")
+ggsave(filename = paste0(Date,"_",stem,"_PCA_source", ".tiff"), plot = PCA,path=DATA_DIR, width = 15, height = 8, dpi = 300)
+PCA
+
+PCA2<-DimPlot(ctb_seurat, reduction = "pca",group.by="contrast",pt.size=5,dims=c(1,2)) +theme(legend.position = c(0.8, 0.8))+ggtitle("PCA plot showing CTB clusters")
+ggsave(filename = paste0(Date,"_",stem,"_PCA_contrast", ".tiff"), plot = PCA2,path=DATA_DIR, width = 15, height = 8, dpi = 300)
+PCA2
+
+PCA3<-DimPlot(ctb_seurat, reduction = "pca",group.by="CellType",pt.size=5,dims=c(1,2)) +theme(legend.position = c(0.8, 0.8))+ggtitle("PCA plot showing CTB clusters")
+ggsave(filename = paste0(Date,"_",stem,"_PCA_CellType", ".tiff"), plot = PCA3,path=DATA_DIR, width = 15, height = 8, dpi = 300)
+PCA3
+
+VizDimLoadings(ctb_seurat, dims = 1:2, reduction = "pca") 
+
+#Number of samples below 0.5E06 total count
+n_500k<-ncol(subset(ctb_seurat,nCount_RNA<500000))
+names_500k<-colnames(subset(ctb_seurat,nCount_RNA<500000))
+
+
+#Number of samples with less than 2000 genes
+n_2000<-ncol(subset(ctb_seurat,nFeature_RNA<2000))
+names_2000<-colnames(subset(ctb_seurat,nFeature_RNA<2000))
+
+#Number of samples with less than 500k counts and less than 2000 genes
+colnames(subset(ctb_seurat,nCount_RNA<500000 & nFeature_RNA<2000))
+
+print(paste0("There are ",n_500k,"samples with less than 500000 counts:",names_500k))
+print(paste0("There are ",n_2000,"samples with less than 2000 genes:",names_2000))
+
+```
+
+```{r heatmap }
+
+#Getting CPM counts 
+cpm_counts<-cpm(countsf)
+
+write.csv(cpm_counts,paste0(DATA_DIR,"/",Date,"_",stem,"_CPM_counts",".csv"))
+
+#Uploading gene sets for calssfication of cells and also plotting using heatmap
+#Gene sets
+cellatlas<-read_excel("//rc-qnap-02/sequencing_data/Gene sets/CellAtlasSuggestedGenes_CEH_2023Dec.xlsx")
+cellatlas<-cellatlas[-c(41,48),]
+
+vento_tormo_marker<-read_excel("//rc-qnap-02/sequencing_data/Gene sets/Vento_Tormo_trophoblast_markers.xlsx")
+
+
+
+#Determining percent trophile and WBC genes in each of the cells sequenced
+CTB<-subset(cellatlas,Source != "WBC")
+WBC<-subset(cellatlas,Source == "WBC")
+
+cpm_SF_ca<-cpm_counts[CTB$Gene,]
+cpm_SF_wbc<-cpm_counts[WBC$Gene,]
+
+cpm_thresholds <- c(0.01,0.1,0.25,0.5,1,2.5,5,10)
+
+###Testing percentage genes identified with cell atlas dataset
+#cell atlas trophoblast list applied
+#Calculate the percentage of genes identified for each threshold
+pct_TrophoGenes <- sapply(cpm_thresholds, function(threshold) {
+  colSums(cpm_SF_ca >= threshold)/nrow(cpm_SF_ca)*100
+})
+pct_TrophoGenes<-as.data.frame(pct_TrophoGenes)
+colnames(pct_TrophoGenes)<-c("Thresh0.01","Thresh0.1","Thresh0.25","Thresh0.5","Thresh1","Thresh2.5","Thresh5","Thresh10")
+
+#WBC genes from Salmon count
+pct_WBCGenes <- sapply(cpm_thresholds, function(threshold) {
+  colSums(cpm_SF_wbc >= threshold)/nrow(cpm_SF_wbc)*100
+})
+pct_WBCGenes<-as.data.frame(pct_WBCGenes)
+colnames(pct_WBCGenes)<-c("Thresh0.01","Thresh0.1","Thresh0.25","Thresh0.5","Thresh1","Thresh2.5","Thresh5","Thresh10")
+
+#Classification of cells at CPM=1
+
+pct_combined<-data.frame(cbind(pct_TrophoGenes$Thresh1,pct_WBCGenes$Thresh1), row.names = rownames(pct_TrophoGenes))
+colnames(pct_combined)<-c("pct_tropho","pct_WBC")
+pct_combined$cells<-rownames(pct_combined)
+
+#creating new column with classification
+pct_combined$mol_classify =NA
+pct_combined<-pct_combined %>%
+    mutate(mol_classify = case_when(
+        (pct_combined$pct_tropho >=50 & pct_combined$pct_WBC<=20) ~ "high_quality_CTB",
+        (between(pct_combined$pct_tropho,25,50) & pct_combined$pct_WBC<=20) ~ "low_quality_CTB",
+        (pct_combined$pct_tropho >=50 & pct_combined$pct_WBC>20)~ "high_quality_hybrid",
+        (between(pct_combined$pct_tropho,25,50) & pct_combined$pct_WBC>20)~ "low_quality_hybrid",
+        (pct_combined$pct_tropho <25)~ "filtered_out",
+    ))
+pct_combined$mol_classify[jeg_colindex]<-"control_JEG"
+pct_combined$mol_classify[wbc_colindex]<-"control_WBC"
+
+metadata_qc<-merge.data.frame(metadata_qc,pct_combined,by=intersect('cells','cells'))
+rownames(metadata_qc)<-metadata_qc$cells
+
+write.csv(metadata_qc,paste0(META_DIR,"/",Date,"_",stem,"_metadata_updated",".csv"))
+
+
+#Visualization using heatmap
+
+#Annotation colors
+ann_colors7 = list(
+CellType = c(JEG = "chartreuse",WBC ="firebrick", CTB = "royalblue", IND = "#C59900", HYB = "slateblue"),
+Condition = c(Live = "blue", Fixed = "pink"),
+Source = c("EVT database" = "purple", "clinical expression" = "#D95F02", "staining cocktail" = "steelblue", "enrichment cocktail" = "deeppink", WBC = "green"),
+molecular_classification = c(control_JEG="chartreuse",control_WBC="firebrick", high_quality_CTB = "royalblue",  low_quality_CTB ="#00BBDB" ,high_quality_hybrid="slateblue", low_quality_hybrid="#CF78FF", filtered_out = "grey80"))
+
+
+#Column order, ordered by molecular classification
+col_order <- c("control_JEG", "control_WBC", "high_quality_CTB","low_quality_CTB","high_quality_hybrid","low_quality_hybrid" ,"filtered_out")
+
+#Metadata ordered by molecualr classification
+metadata_plot<-metadata_qc%>%
+    mutate(molecular_classification =  factor(mol_classify, levels = col_order)) %>%
+    arrange(molecular_classification)
+rownames(metadata_plot)<-metadata_plot$cells
+
+#Gene annotation for categories using cell atlas db
+gene_cats_ca <- cellatlas
+gene_cats_ca<-gene_cats_ca %>% remove_rownames %>% column_to_rownames(var="Gene")
+
+#reorder cpm columns according to classification category using cell atlas genes only
+cpm_CA <- as.matrix(cpm_counts[rownames(cpm_counts) %in% rownames(gene_cats_ca), ])
+cpm_CA<-cpm_CA[rownames(gene_cats_ca),rownames(metadata_plot)]
+
+#heatmap for all cells annotated by molecular classification
+heatmap_cpm_CA_all<-pheatmap(log2(1+cpm_CA),cluster_row=FALSE,cluster_cols=FALSE,color = inferno(500),annotation_col = metadata_plot[,c("CellType","molecular_classification")], annotation_row = gene_cats_ca, fontsize_row = 8, cellheight = 10,annotation_colors = ann_colors7, main = "Heat map(CPM)using curated Cell Atlas Trophoblast / WBC Gene List ",gaps_col = c(length(jeg_colindex),(length(jeg_colindex)+length(wbc_colindex))),border_color="black",show_colnames=T)
+
+ggsave(filename = paste0(Date,"_",stem,"_CPM_heatmap_CA_allsamples",".tiff"), plot = heatmap_cpm_CA_all, width = 15, height = 10, dpi = 300,path=DATA_DIR)
+
+heatmap_cpm_CA_all
+
+#Normalization with TMMwsp
+
+#Filtering samples by count and
+keepGenes<- (rowSums((cpm_counts) >= .5) >= 2)
+kable(table(keepGenes), caption = "Genes that pass low expression filter")
+filtered_counts<-countsf[keepGenes,]
+
+dge<-DGEList(counts=filtered_counts)
+dge_wsp<- normLibSizes(dge, method = "TMMwsp")
+counts_TMMwsp<-cpm(dge_wsp)
+
+write.csv(counts_TMMwsp,paste0(DATA_DIR,"/",Date,"_",stem,"_TMM_counts",".csv"))
+
+#checking genes from genelist filtered out
+tmm_CA<-as.matrix(counts_TMMwsp[rownames(counts_TMMwsp) %in% rownames(gene_cats_ca), ])
+remove_geneCA<-rownames(gene_cats_ca)[!(rownames(gene_cats_ca) %in% rownames(tmm_CA))]
+gene_cats_ca_filtered<-rownames_to_column(gene_cats_ca)
+gene_cats_ca_filtered<-gene_cats_ca_filtered %>%
+  filter(!(rowname %in% c(remove_geneCA)))
+
+gene_cats_ca_filtered<-gene_cats_ca_filtered %>% remove_rownames %>% column_to_rownames(var="rowname")
+tmm_CA<-tmm_CA[rownames(gene_cats_ca_filtered),rownames(metadata_plot)]
+
+heatmap_TMMwsp_all<-pheatmap(log2(1+tmm_CA),cluster_row=FALSE,cluster_cols=FALSE,color = inferno(500),annotation_col = metadata_plot[,c("CellType","molecular_classification")], annotation_row = gene_cats_ca_filtered, fontsize_row = 8, cellheight = 10,annotation_colors = ann_colors7, main = "Heat map(TMM) using curated Cell Atlas Trophoblast / WBC Gene List ",gaps_col = c(length(jeg_colindex),(length(jeg_colindex)+length(wbc_colindex))),border_color="black",show_colnames=T)
+
+ggsave(filename = paste0(Date,"_",stem,"_TMM_heatmap_CA_allsamples",".tiff"), plot = heatmap_TMMwsp_all, width = 15, height = 10, dpi = 300,path=DATA_DIR)
+
+heatmap_TMMwsp_all
+
+#testin 3D PCA
+
+X <- t(log2(1+tmm_CA))
+prin_comp <- prcomp(X)
+explained_variance_ratio <- summary(prin_comp)[["importance"]]['Proportion of Variance',]
+explained_variance_ratio <- 100 * explained_variance_ratio
+components <- prin_comp[["x"]]
+components <- data.frame(components)
+components <- cbind(components, metadata_plot$molecular_classification)
+components$PC3 <- -components$PC3
+components$PC2 <- -components$PC2
+axis = list(showline=FALSE,
+            zeroline=FALSE,
+            gridcolor='#ffff',
+            ticklen=4,
+            titlefont=list(size=13))
+PCA_2D <- plot_ly(components, x = ~PC1, y = ~PC2, color = ~metadata_plot$molecular_classification,colors = c("chartreuse","firebrick", "royalblue", "#00BBDB" ,"slateblue", "#CF78FF", "grey80"), type = 'scatter', mode = 'markers')%>%
+  layout(
+    legend=list(title=list(text='color')),
+    plot_bgcolor='#e5ecf6',
+    xaxis = list(
+      title = "PC1",
+      zerolinecolor = "#ffff",
+      zerolinewidth = 2,
+      gridcolor='#ffff'),
+    yaxis = list(
+      title = "PC2",
+      zerolinecolor = "#ffff",
+      zerolinewidth = 2,
+      gridcolor='#ffff'))
+PCA_2D
+
+PCA_3D <- plot_ly(components, x = ~PC1, y = ~PC2, z = ~PC3, color = ~metadata_plot$molecular_classification,colors = c("chartreuse","firebrick", "royalblue", "#00BBDB" ,"slateblue", "#CF78FF", "grey80"),marker = list(size = 4))  %>%
+  add_markers(size = 12)
+
+
+PCA_3D <- PCA_3D %>%
+  layout(
+    title = "3D PCA plot using TMMwsp normalized data",
+    scene = list(bgcolor = "#e5ecf6")
+)
+
+
+setwd(DATA_DIR)
+saveWidget(ggplotly(PCA_3D), file = paste0(Date,"_",stem,"_TMM_3DPCA_allsamples",".html"))
+
+PCA_3D
+
+#DESEQ2
+#Comparing high quality CTB vs WBC
+
+dds <- DESeqDataSetFromMatrix(countData = round(countsf),
+                              colData = metadata_qc,
+                              design= ~ mol_classify)
+#dds <- DESeq(dds)
+dds <- estimateSizeFactors(dds)
+deseq_counts<-counts(dds,normalized=TRUE)
+write.csv(deseq_counts,paste0(DATA_DIR,"/",Date,"_",stem,"_DESEQ_counts",".csv"))
+
+dds<-DESeq(dds)
+plotDispEsts(dds)
+plotDispEsts(dds,CV=TRUE)
+res<-results(dds, contrast=c("mol_classify","high_quality_CTB","control_WBC"))
+res_df<-as.data.frame(res[!is.na(res$padj),])
+res_df_test<-res_df[!rownames(res_df) %in% c(mito_genes,ribo_genes,linc_genes),]
+eplot<-EnhancedVolcano(res_df,
+                lab = rownames(res_df),
+                x = 'log2FoldChange',
+                y = 'padj', pCutoff = 10e-3,
+                title = "CTB vs WBC",
+                labSize = 3.5)+coord_cartesian(xlim=c(-30, 30),ylim=c(0,40))+scale_x_continuous(breaks=seq(-30,30,10))+scale_y_continuous(breaks=seq(0,30,10))
+
+ggsave(filename = paste0(Date,"_",stem,"_Volcano_plot",".tiff"), plot = eplot, width = 10, height = 10, dpi = 300,path=DATA_DIR)
+
+eplot
+
+vsd<-DESeq2::vst(dds,blind=FALSE)
+count_vst<-assay(vsd)
+write.csv(count_vst,paste0(DATA_DIR,"/",Date,"_",stem,"_VST_counts",".csv"))
+
+vst_CA<-count_vst[rownames(gene_cats_ca_filtered),rownames(metadata_plot)]
+
+heatmap_VST_all<-pheatmap(vst_CA,cluster_row=FALSE,cluster_cols=FALSE,color = inferno(500),annotation_col = metadata_plot[,c("CellType","molecular_classification")], annotation_row = gene_cats_ca_filtered, fontsize_row = 8, cellheight = 10,annotation_colors = ann_colors7, main = "Heat map(VST) using curated Cell Atlas Trophoblast / WBC Gene List ",gaps_col = c(length(jeg_colindex),(length(jeg_colindex)+length(wbc_colindex))),border_color="black",show_colnames=T)
+
+ggsave(filename = paste0(Date,"_",stem,"_VST_heatmap_CA_allsamples",".tiff"), plot = heatmap_VST_all, width = 15, height = 10, dpi = 300,path=DATA_DIR)
+
+heatmap_VST_all
+
+write.csv(res_df_test,paste0(DATA_DIR,"/",Date,"_",stem,"_results_Deseq",".csv"))
+
+setwd(RMD_DIR)
+writeLines(capture.output(sessionInfo()), paste0(Date,"_",stem,"_sessionInfo.txt"))
+```
+
+```{r render a pdf}
+#rmarkdown::render(paste0(RMD_DIR,"/2024March_SC_Analyses.Rmd"),output_format = "pdf_document")
+```
+#End
